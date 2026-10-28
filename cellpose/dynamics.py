@@ -354,6 +354,22 @@ def steps_interp(dP, inds, niter, device=torch.device("cpu")):
         else:
             pt[0, 0, :, ndim - n - 1] = torch.from_numpy(inds[n]).to(device, dtype=torch.float32)
         im[0, ndim - n - 1] = torch.from_numpy(dP[n]).to(device, dtype=torch.float32)
+    return _steps_interp_run(im, pt, shape, niter)
+
+
+def _steps_interp_run(im, pt, shape, niter):
+    """Euler integration of steps_interp on the prepared flow image and start points.
+
+    Args:
+        im (torch.Tensor): Flows [1 x ndim x (Lz x) Ly x Lx], channels in X, Y(, Z) order.
+        pt (torch.Tensor): Start points [1 x 1 (x 1) x n_points x ndim] in X, Y(, Z) order (pixels).
+        shape (tuple): Spatial shape of the flows.
+        niter (int): Number of iterations.
+
+    Returns:
+        torch.Tensor: Final pixel locations [ndim x n_points] in (Z,) Y, X order.
+    """
+    ndim = len(shape)
     shape = np.array(shape)[::-1].astype("float") - 1  
     
     # normalize pt between  0 and  1, normalize the flow
@@ -599,6 +615,8 @@ def get_masks_torch(pt, inds, shape0, rpad=20, max_size_fraction=0.4):
     M1 = M1.reshape(shape)
 
     M1 = M1[pt[0], pt[1]] if ndim == 2 else M1[pt[0], pt[1], pt[2]]
+    if torch.is_tensor(inds):
+        return _label_from_seeds_device(M1, inds, shape0, n_seeds, max_size_fraction)
     M1 = M1.cpu().numpy()
 
     dtype = "uint16" if n_seeds < 2**16 else "uint32"
@@ -620,7 +638,8 @@ def get_masks_torch(pt, inds, shape0, rpad=20, max_size_fraction=0.4):
 
 def resize_and_compute_masks(dP, cellprob, niter=200, cellprob_threshold=0.0,
                              flow_threshold=0.4, do_3D=False, min_size=15,
-                             max_size_fraction=0.4, resize=None, device=torch.device("cpu")):
+                             max_size_fraction=0.4, resize=None, device=torch.device("cpu"),
+                             fill_holes=True, overwrite=False):
     """Compute masks using dynamics from dP and cellprob, and resizes masks if resize is not None.
 
     Args:
@@ -637,6 +656,9 @@ def resize_and_compute_masks(dP, cellprob, niter=200, cellprob_threshold=0.0,
             total image size are removed. Default is 0.4.
         resize (tuple, optional): The desired size for resizing the masks. Defaults to None.
         device (torch.device, optional): The device to use for computation. Defaults to torch.device("cpu").
+        fill_holes (bool, optional): Fill holes and remove masks smaller than min_size after the
+            resize; False returns the masks before this step. Defaults to True.
+        overwrite (bool, optional): See compute_masks. Defaults to False.
 
     Returns:
         tuple: A tuple containing the computed masks and the final pixel locations.
@@ -645,7 +667,7 @@ def resize_and_compute_masks(dP, cellprob, niter=200, cellprob_threshold=0.0,
                             cellprob_threshold=cellprob_threshold,
                             flow_threshold=flow_threshold, do_3D=do_3D,
                             max_size_fraction=max_size_fraction, 
-                            device=device)
+                            device=device, overwrite=overwrite)
 
     if resize is not None:
         if len(resize) == 2:
@@ -665,14 +687,15 @@ def resize_and_compute_masks(dP, cellprob, niter=200, cellprob_threshold=0.0,
                                                     no_channels=True, 
                                                     interpolation=cv2.INTER_NEAREST).transpose(1,0,2)
 
-    mask = utils.fill_holes_and_remove_small_masks(mask, min_size=min_size)
+    if fill_holes:
+        mask = utils.fill_holes_and_remove_small_masks(mask, min_size=min_size)
 
     return mask
 
 
 def compute_masks(dP, cellprob, p=None, niter=200, cellprob_threshold=0.0,
                   flow_threshold=0.4, do_3D=False, min_size=-1,
-                  max_size_fraction=0.4, device=torch.device("cpu")):
+                  max_size_fraction=0.4, device=torch.device("cpu"), overwrite=False):
     """Compute masks using dynamics from dP and cellprob.
 
     Args:
@@ -688,10 +711,18 @@ def compute_masks(dP, cellprob, p=None, niter=200, cellprob_threshold=0.0,
         max_size_fraction (float, optional): Masks larger than max_size_fraction of
             total image size are removed. Default is 0.4.
         device (torch.device, optional): The device to use for computation. Defaults to torch.device("cpu").
+        overwrite (bool, optional): With dP and cellprob as tensors on the device, the memory of dP
+            may be reused for the dynamics (dP is changed). Defaults to False.
 
     Returns:
         tuple: A tuple containing the computed masks and the final pixel locations.
     """
+    if torch.is_tensor(cellprob):
+        mask = _compute_masks_device(dP, cellprob, niter=niter, cellprob_threshold=cellprob_threshold,
+                                     do_3D=do_3D, max_size_fraction=max_size_fraction, overwrite=overwrite)
+        if min_size > 0:
+            mask = utils.fill_holes_and_remove_small_masks(mask, min_size=min_size)
+        return mask
     
     if (cellprob > cellprob_threshold).sum():  #mask at this point is a cell cluster binary map, not labels
         inds = np.nonzero(cellprob > cellprob_threshold)
@@ -741,3 +772,117 @@ def compute_masks(dP, cellprob, p=None, niter=200, cellprob_threshold=0.0,
             "more than 65535 masks in image, masks returned as np.uint32")
 
     return mask
+
+
+def _compute_masks_device(dP, cellprob, niter=200, cellprob_threshold=0.0, do_3D=False,
+                          max_size_fraction=0.4, overwrite=False):
+    """compute_masks (min_size off) for 3D flows and cell probability held on the device.
+
+    The same steps and arithmetic as compute_masks with numpy inputs, so the masks are
+    equal to the bit; only the labels leave the device.
+
+    Args:
+        dP (torch.Tensor): Flows [3 x Lz x Ly x Lx] (float32).
+        cellprob (torch.Tensor): Cell probability [Lz x Ly x Lx] (float32).
+        overwrite (bool): Reuse the memory of dP for the dynamics and release it after
+            the dynamics (dP and the tensors sharing its storage are consumed).
+
+    Returns:
+        numpy.ndarray: Labels [Lz x Ly x Lx], uint16 (uint32 above 65535 masks).
+    """
+    if not do_3D or dP.shape[0] != 3:
+        raise ValueError("masks on the device are implemented for 3D flows (do_3D=True)")
+    device = dP.device
+    shape = tuple(int(v) for v in cellprob.shape)
+    ndim = len(shape)
+    cm = cellprob > cellprob_threshold
+    # cell pixels as flat indices (C order, as np.nonzero)
+    flat = torch.nonzero(cm.view(-1)).flatten()
+    if len(flat) == 0:
+        dynamics_logger.info("No cell pixels found.")
+        return np.zeros(shape, "uint16")
+    # flows of the dynamics: dP * (cellprob > threshold) / 5, in X, Y, Z order; a device
+    # tensor divisor keeps the true division (a CPU scalar is applied as a reciprocal)
+    five = torch.tensor(5., dtype=torch.float32, device=device)
+    if overwrite and dP.is_contiguous():
+        t0 = dP[0] * cm
+        t0.div_(five)
+        t2 = dP[2] * cm
+        t2.div_(five)
+        dP[0].copy_(t2)
+        del t2
+        dP[2].copy_(t0)
+        del t0
+        dP[1].mul_(cm)
+        dP[1].div_(five)
+        im = dP.unsqueeze(0)
+    else:
+        im = torch.empty((1, ndim, *shape), dtype=torch.float32, device=device)
+        for d in range(ndim):
+            im[0, ndim - d - 1] = (dP[d] * cm).div_(five)
+    del cm
+    pt = torch.zeros((*[1] * ndim, len(flat), ndim), dtype=torch.float32, device=device)
+    rest = flat
+    for d in range(ndim - 1, -1, -1):
+        pt[..., ndim - d - 1] = (rest % shape[d]).to(torch.float32)
+        rest = rest // shape[d]
+    del rest
+    p_final = _steps_interp_run(im, pt, shape, niter)
+    del im, pt
+    if overwrite:
+        try:
+            dP.untyped_storage().resize_(0)
+        except RuntimeError:  # storage not owned by torch (e.g. from numpy): kept
+            pass
+    p_final = p_final.int()
+    return get_masks_torch(p_final, flat, shape, max_size_fraction=max_size_fraction)
+
+
+def _label_from_seeds_device(M1, inds, shape0, n_seeds, max_size_fraction=0.4):
+    """End of get_masks_torch on the device: labels at inds, big masks removed, renumbered.
+
+    inds are the pixels of M1 as a tensor: [n x ndim] coordinates or [n] flat (C order) indices.
+
+    Equal to the numpy steps (M0[inds] = M1, fastremap.mask of the masks above
+    max_size_fraction, fastremap.renumber in order of first appearance).
+
+    Returns:
+        numpy.ndarray: Labels of shape0, uint16 (uint32 above 65535 masks).
+    """
+    device = M1.device
+    shape0 = tuple(int(v) for v in shape0)
+    N = int(np.prod(shape0))
+    n = len(M1)
+    M1 = M1.long()
+    counts = torch.bincount(M1, minlength=n_seeds + 1)
+    counts[0] += N - n
+    big = np.prod(shape0) * max_size_fraction
+    bigc = torch.nonzero(counts > big).flatten()
+    if len(bigc) > 0 and (len(bigc) > 1 or int(bigc[0]) != 0):
+        lut = torch.arange(n_seeds + 1, device=device)
+        lut[bigc] = 0
+        M1 = lut[M1]
+        del lut
+    # renumber in order of first appearance in C order (inds are sorted), 0 stays 0
+    first = torch.full((n_seeds + 1,), n, dtype=torch.int64, device=device)
+    first.scatter_reduce_(0, M1, torch.arange(n, device=device), reduce="amin", include_self=True)
+    first[0] = n
+    present = torch.nonzero(first < n).flatten()
+    order = present[torch.argsort(first[present])]
+    new = torch.zeros(n_seeds + 1, dtype=torch.int64, device=device)
+    new[order] = torch.arange(1, len(order) + 1, device=device)
+    n_masks = len(order)
+    vals = new[M1]
+    del M1, first, new
+    if inds.ndim == 1:
+        flat = inds
+    else:
+        flat = inds[:, 0]
+        for d in range(1, len(shape0)):
+            flat = flat * shape0[d] + inds[:, d]
+    M0 = torch.zeros(N, dtype=torch.int32, device=device)
+    M0[flat] = vals.to(torch.int32)
+    del vals, flat
+    if n_masks < 2**16:
+        return M0.to(torch.uint16).reshape(shape0).cpu().numpy()
+    return M0.reshape(shape0).cpu().numpy().astype("uint32")

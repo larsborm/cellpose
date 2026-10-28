@@ -21,7 +21,7 @@ try:
     from .vit import CPDINO
 except:
     models_logger.warning("Could not import CPDINO, run `pip install git+https://github.com/facebookresearch/dinov3` to use CPDINO model")
-from .core import assign_device, run_net, run_3D
+from .core import assign_device, run_net, run_3D, run_3D_device
 
 _MODEL_URL = "https://huggingface.co/mouseland/cellpose-sam/resolve/main/"
 _MODEL_DIR_ENV = os.environ.get("CELLPOSE_LOCAL_MODELS_PATH")
@@ -188,7 +188,7 @@ class CellposeModel():
              flow3D_smooth=0, stitch_threshold=0.0, min_size=15, max_size_fraction=0.4, 
              niter=None, augment=False, tile_overlap=0.1, bsize=None, 
              compute_masks=True, progress=None, pack_thin=False, pack_gap_min=24,
-             skip_empty_tiles=None):
+             skip_empty_tiles=None, on_device=False, return_flows=True, fill_holes=True):
         """ segment list of images x, or 4D array - Z x 3 x Y x X
 
         Args:
@@ -236,6 +236,18 @@ class CellposeModel():
                 tile). Defaults to 24.
             skip_empty_tiles (float, optional): tiles whose maximum normalized value is below this are not
                 run through the network (no cells there). Defaults to None.
+            on_device (bool, optional): for do_3D on a CUDA device, keep the stack, the tiles, the
+                network outputs, the tile blending, the flows and the mask computation on the device
+                (core.run_3D_device, dynamics.compute_masks with tensors). The masks and flows are equal
+                to the bit to the default path; the device needs about 20 bytes per voxel of the
+                (resized) stack on top of the network. Ignored without do_3D, with augment=True or
+                without CUDA. Defaults to False.
+            return_flows (bool, optional): return the flows; False returns [None, None, None] in their
+                place, skips the flow RGB image and, with on_device, lets the mask computation reuse the
+                flows' memory. Defaults to True.
+            fill_holes (bool, optional): fill holes in the masks and remove masks smaller than min_size
+                (after the masks are resized to the image); False returns the masks before this step.
+                Defaults to True.
 
         Returns:
             A tuple containing (masks, flows, styles): 
@@ -276,7 +288,8 @@ class CellposeModel():
                                 augment=augment, tile_overlap=tile_overlap, bsize=bsize, 
                                 compute_masks=compute_masks, progress=progress,
                                 pack_thin=pack_thin, pack_gap_min=pack_gap_min,
-                                skip_empty_tiles=skip_empty_tiles)
+                                skip_empty_tiles=skip_empty_tiles, on_device=on_device,
+                                return_flows=return_flows, fill_holes=fill_holes)
                 self.timing.append(time.time() - tic)
                 masks.append(out[0])
                 flows.append(out[1])
@@ -284,6 +297,9 @@ class CellposeModel():
             return masks, flows, styles
 
         ############# eval code ############
+        if on_device and (not do_3D or augment or self.device.type != "cuda"):
+            models_logger.warning("on_device needs do_3D=True, augment=False and a CUDA device; running on the CPU")
+            on_device = False
         # reshape image
         x = transforms.convert_image(x, channel_axis=channel_axis, z_axis=z_axis, 
                                      do_3D=(do_3D or stitch_threshold > 0))
@@ -326,8 +342,10 @@ class CellposeModel():
                                              tile_overlap=tile_overlap, bsize=bsize,
                                              do_3D=do_3D, anisotropy=anisotropy,
                                              pack_thin=pack_thin, pack_gap_min=pack_gap_min,
-                                             skip_empty_tiles=skip_empty_tiles)
+                                             skip_empty_tiles=skip_empty_tiles, on_device=on_device)
 
+        if do_3D and flow3D_smooth and torch.is_tensor(dP):
+            dP, cellprob = dP.cpu().numpy(), cellprob.cpu().numpy()
         if do_3D and flow3D_smooth:
             if isinstance(flow3D_smooth, (int, float)):
                 flow3D_smooth = [flow3D_smooth]*3 
@@ -351,10 +369,15 @@ class CellposeModel():
                                         min_size=min_size,
                                         max_size_fraction=max_size_fraction, 
                                         niter=niter, stitch_threshold=stitch_threshold, 
-                                        do_3D=do_3D)
+                                        do_3D=do_3D, fill_holes=fill_holes,
+                                        overwrite=not return_flows)
         else:
             masks = np.zeros(0) #pass back zeros if not compute_masks
         
+        if not return_flows:
+            return masks.squeeze(), [None, None, None], styles
+        if torch.is_tensor(dP):
+            dP, cellprob = dP.cpu().numpy(), cellprob.cpu().numpy()
         masks, dP, cellprob = masks.squeeze(), dP.squeeze(), cellprob.squeeze()
 
         return masks, [plot.dx_to_circ(dP), dP, cellprob], styles #plot.dx_to_circ(dP)
@@ -362,7 +385,7 @@ class CellposeModel():
 
     def _run_net(self, x, rescale=1.0, resample=True, augment=False, batch_size=8,
                  tile_overlap=0.1, bsize=None, anisotropy=1.0, do_3D=False,
-                 pack_thin=False, pack_gap_min=24, skip_empty_tiles=None):
+                 pack_thin=False, pack_gap_min=24, skip_empty_tiles=None, on_device=False):
         """ run network on image x """
         tic = time.time()
         shape = x.shape
@@ -379,11 +402,26 @@ class CellposeModel():
                 new_shape = (int(Lz*anisotropy*rescale), int(Ly*rescale), int(Lx*rescale))
                 x = transforms.resize_image_3d(x, new_shape, no_channels=False)
                 
-            yf, styles = run_3D(self.net, x, batch_size=batch_size, augment=augment,  
-                                tile_overlap=tile_overlap, bsize=bsize,
-                                pack_thin=pack_thin, pack_gap_min=pack_gap_min,
-                                skip_empty_tiles=skip_empty_tiles,
-                                fixed_batch=self.net_compiled)
+            if on_device:
+                xt = torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32)).to(self.device)
+                yf = run_3D_device(self.net, xt, batch_size=batch_size, tile_overlap=tile_overlap,
+                                   bsize=bsize, pack_thin=pack_thin, pack_gap_min=pack_gap_min,
+                                   skip_empty_tiles=skip_empty_tiles, fixed_batch=self.net_compiled)
+                del xt
+                styles = np.zeros(256, "float32")
+                if not (resample and (rescale != 1.0 or Lz != yf.shape[1])):
+                    net_time = time.time() - tic
+                    if nimg > 1:
+                        models_logger.info("network run in %2.2fs" % (net_time))
+                    return yf[:3], yf[3], styles
+                # flows back to the image size on the CPU, as without on_device
+                yf = yf.permute(1, 2, 3, 0).cpu().numpy()
+            else:
+                yf, styles = run_3D(self.net, x, batch_size=batch_size, augment=augment,  
+                                    tile_overlap=tile_overlap, bsize=bsize,
+                                    pack_thin=pack_thin, pack_gap_min=pack_gap_min,
+                                    skip_empty_tiles=skip_empty_tiles,
+                                    fixed_batch=self.net_compiled)
             
             if resample:
                 if rescale != 1.0 or Lz != yf.shape[0]:
@@ -414,7 +452,7 @@ class CellposeModel():
     
     def _compute_masks(self, shape, dP, cellprob, flow_threshold=0.4, cellprob_threshold=0.0,
                        min_size=15, max_size_fraction=0.4, niter=None,
-                       do_3D=False, stitch_threshold=0.0):
+                       do_3D=False, stitch_threshold=0.0, fill_holes=True, overwrite=False):
         """ compute masks from flows and cell probability """
         if self.device.type == "mps" and do_3D:
             models_logger.warning("MPS does not support 3D post-processing, using CPU")
@@ -431,7 +469,7 @@ class CellposeModel():
                 min_size=min_size, max_size_fraction=max_size_fraction, 
                 resize=shape[:3] if (np.array(dP.shape[-3:])!=np.array(shape[:3])).sum() 
                         else None,
-                device=device)
+                device=device, fill_holes=fill_holes, overwrite=overwrite)
         else:
             nimg = shape[0]
             Ly0, Lx0 = cellprob[0].shape 
@@ -447,7 +485,7 @@ class CellposeModel():
                     niter=niter, cellprob_threshold=cellprob_threshold,
                     flow_threshold=flow_threshold, resize=resize,
                     min_size=min_size0, max_size_fraction=max_size_fraction,
-                    device=device)
+                    device=device, fill_holes=fill_holes)
                 if i==0 and nimg > 1:
                     masks = np.zeros((nimg, shape[1], shape[2]), outputs.dtype)
                 if nimg > 1:

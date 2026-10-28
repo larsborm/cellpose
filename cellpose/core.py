@@ -394,3 +394,223 @@ def run_3D(net, imgs, batch_size=8, augment=False,
             progress.setValue(25 + 15 * p)
     
     return yf, style
+
+
+# ---------------------------------------------------------------------------
+# Device-resident inference: the planes, the tiles, the network outputs and the
+# tile blending stay on the network's device. Same tiles, batches and
+# arithmetic as run_net / run_3D (augment=False, rsz=None), so the outputs are
+# equal to the bit: the blending repeats average_tiles' float64 products and
+# sums, rounded to float32 after every tile as numpy does.
+# ---------------------------------------------------------------------------
+
+def tile_starts(Ly, Lx, bsize=224, tile_overlap=0.1):
+    """Tile starts of transforms.make_tiles (augment=False) for a padded plane of Ly x Lx.
+
+    Returns:
+        tuple: (ystart, xstart, bsizeY, bsizeX) as in make_tiles.
+    """
+    tile_overlap = min(0.5, max(0.05, tile_overlap))
+    bsizeY, bsizeX = int(min(bsize, Ly)), int(min(bsize, Lx))
+    ny = 1 if Ly <= bsize else int(np.ceil((1. + 2 * tile_overlap) * Ly / bsize))
+    nx = 1 if Lx <= bsize else int(np.ceil((1. + 2 * tile_overlap) * Lx / bsize))
+    ystart = np.linspace(0, Ly - bsizeY, ny).astype(int)
+    xstart = np.linspace(0, Lx - bsizeX, nx).astype(int)
+    return ystart, xstart, bsizeY, bsizeX
+
+
+def _run_tiles_device(net, Lz, plane_shape, get_planes, sink, batch_size=8, tile_overlap=0.1,
+                      bsize=224, skip_empty_tiles=None, fixed_batch=False):
+    """run_net's tile loop on the device for Lz planes of plane_shape (Ly0, Lx0, nchan).
+
+    Args:
+        get_planes (callable): get_planes(a, b) -> planes a..b-1 [n x Ly0 x Lx0 x nchan] on the device.
+        sink (callable): sink(a, y) receives the outputs of planes a..a+n-1 [n x Ly0 x Lx0 x nout].
+
+    Returns:
+        None. Skipped tiles are logged as run_net does.
+    """
+    device = net.device
+    Ly0, Lx0, nchan = plane_shape
+    ypad1, ypad2, xpad1, xpad2 = transforms.get_pad_yx(Ly0, Lx0, min_size=(bsize, bsize))
+    Ly, Lx = Ly0 + ypad1 + ypad2, Lx0 + xpad1 + xpad2
+    ny = 1 if Ly <= bsize else int(np.ceil((1. + 2 * tile_overlap) * Ly / bsize))
+    nx = 1 if Lx <= bsize else int(np.ceil((1. + 2 * tile_overlap) * Lx / bsize))
+    ntiles = ny * nx
+    ystart, xstart, ly, lx = tile_starts(Ly, Lx, bsize=bsize, tile_overlap=tile_overlap)
+    if len(ystart) * len(xstart) != ntiles:
+        raise ValueError("tile grid differs from run_net's tile count")
+    rows = torch.as_tensor(ystart[:, None] + np.arange(ly)[None], device=device)
+    cols = torch.as_tensor(xstart[:, None] + np.arange(lx)[None], device=device)
+    # taper mask and its sum over the tiles, float64 as in average_tiles
+    mask = torch.from_numpy(transforms._taper_mask(ly=ly, lx=lx)).to(device)
+    subs = [(slice(int(y0), int(y0) + ly), slice(int(x0), int(x0) + lx)) for y0 in ystart for x0 in xstart]
+    navg = torch.zeros((Ly, Lx), dtype=torch.float64, device=device)
+    for ys, xs in subs:
+        navg[ys, xs] += mask
+
+    per_iter = batch_size * (8 if (skip_empty_tiles is not None or fixed_batch) else 1)
+    nimgs = max(1, per_iter // ntiles)
+    niter = int(np.ceil(Lz / nimgs))
+    nout = 3
+    spans = [(k * nimgs, min(Lz, (k + 1) * nimgs)) for k in range(niter)]
+
+    def tiles_of(a, b):
+        # tiles in make_tiles order: plane, tile row, tile column
+        planes = get_planes(a, b).permute(0, 3, 1, 2)
+        imgb = torch.zeros((b - a, nchan, Ly, Lx), dtype=torch.float32, device=device)
+        imgb[:, :, ypad1:ypad1 + Ly0, xpad1:xpad1 + Lx0] = planes
+        del planes
+        IMGa = imgb[:, :, rows[:, None, :, None], cols[None, :, None, :]]
+        return IMGa.permute(0, 2, 3, 1, 4, 5).reshape((b - a) * ntiles, nchan, ly, lx)
+
+    # the tiles to run, for every batch of planes at once: one host sync before the
+    # loop instead of one per batch, so the loop queues its work without waiting
+    if skip_empty_tiles is not None:
+        maxima = torch.cat([tiles_of(a, b).reshape((b - a) * ntiles, -1).amax(dim=1) for a, b in spans])
+        run = (maxima >= skip_empty_tiles).cpu().numpy()
+        del maxima
+        n_skipped = int((~run).sum())
+        idx_all = [np.flatnonzero(run[a * ntiles:b * ntiles]) for a, b in spans]
+    else:
+        n_skipped = 0
+        idx_all = [np.arange((b - a) * ntiles) for a, b in spans]
+    counts = [len(i) for i in idx_all]
+    idx_dev = torch.as_tensor(np.concatenate(idx_all) if idx_all else np.zeros(0, np.int64), device=device)
+    offs = np.concatenate([[0], np.cumsum(counts)])
+    net.eval()
+    for k, (a, b) in enumerate(spans):
+        nb = b - a
+        IMGa = tiles_of(a, b)
+        ya = torch.zeros((IMGa.shape[0], nout, ly, lx), dtype=torch.float32, device=device)
+        ya[:, -1] = -10.0  # skipped tiles: no flow, no cell
+        idx = idx_dev[offs[k]:offs[k + 1]]
+        for j in range(0, counts[k], batch_size):
+            bslc = idx[j:j + batch_size]
+            X = IMGa[bslc]
+            n = X.shape[0]
+            if fixed_batch and n < batch_size:
+                X = torch.cat([X, torch.zeros((batch_size - n,) + tuple(X.shape[1:]), dtype=X.dtype,
+                                              device=device)], dim=0)
+            X = X.to(net.dtype)
+            with torch.no_grad():
+                y = net(X)[0]
+            ya[bslc] = y[:n].to(torch.float32)
+            del X, y
+        del IMGa
+        # blend the tiles: float64 product and sum, float32 after every tile
+        y = ya.reshape(nb, ntiles, nout, ly, lx)
+        acc = torch.zeros((nb, nout, Ly, Lx), dtype=torch.float32, device=device)
+        for t, (ys, xs) in enumerate(subs):
+            prod = y[:, t].double() * mask
+            acc[:, :, ys, xs] = (acc[:, :, ys, xs].double() + prod).float()
+        del prod, ya, y
+        out = (acc.double() / navg).float()
+        del acc
+        sink(a, out[:, :, ypad1:Ly - ypad2, xpad1:Lx - xpad2].permute(0, 2, 3, 1))
+        del out
+    if skip_empty_tiles is not None and n_skipped:
+        core_logger.info("skipped %d of %d tiles below %.3g" % (n_skipped, ntiles * Lz, skip_empty_tiles))
+
+
+def run_net_device(net, imgi, batch_size=8, tile_overlap=0.1, bsize=224, pack_thin=False,
+                   pack_gap_min=24, skip_empty_tiles=None, fixed_batch=False, sink=None):
+    """run_net (augment=False, rsz=None) with everything on the network's device.
+
+    Args:
+        imgi (torch.Tensor): Planes [Lz x Ly x Lx x nchan] (float32) on the device; a strided view
+            is fine.
+        sink (callable, optional): sink(a, y) receives the outputs of the consecutive planes
+            a..a+n-1 as [n x Ly x Lx x nout] on the device. Without a sink the outputs are
+            returned as one tensor.
+
+    Returns:
+        torch.Tensor or None: [Lz x Ly x Lx x nout] (float32) when sink is None, as run_net's yf.
+    """
+    Lz, Ly0, Lx0, nchan = imgi.shape
+    out = None
+    if sink is None:
+        out = torch.zeros((Lz, Ly0, Lx0, 3), dtype=torch.float32, device=imgi.device)
+
+        def sink(a, y):
+            out[a:a + y.shape[0]] = y
+    k = 1
+    if pack_thin:
+        k, gap = transforms.pack_layout(Ly0, bsize=bsize, gap_min=pack_gap_min)
+    if k > 1:
+        # thin planes packed k per tall plane with zero rows between them (see _run_net_packed)
+        m = int(np.ceil(Lz / k))
+        step = Ly0 + gap
+        H = k * step - gap
+        core_logger.info("packing %d planes of %d rows: %d per tile, %d-row gaps" % (Lz, Ly0, k, gap))
+
+        def get_tall(a, b):
+            tall = torch.zeros((b - a, H, Lx0, nchan), dtype=torch.float32, device=imgi.device)
+            for i in range(k):
+                p0, p1 = a * k + i, min(b * k, Lz)
+                sel = torch.arange(p0, p1, k, device=imgi.device)
+                n_i = len(sel)
+                if n_i:
+                    tall[:n_i, i * step:i * step + Ly0] = imgi[sel]
+            return tall
+
+        def sink_tall(a, y):
+            planes = torch.stack([y[:, i * step:i * step + Ly0] for i in range(k)], dim=1)
+            planes = planes.reshape((-1,) + tuple(planes.shape[2:]))
+            n = min(planes.shape[0], Lz - a * k)
+            sink(a * k, planes[:n])
+
+        _run_tiles_device(net, m, (H, Lx0, nchan), get_tall, sink_tall, batch_size=batch_size,
+                          tile_overlap=tile_overlap, bsize=bsize, skip_empty_tiles=skip_empty_tiles,
+                          fixed_batch=fixed_batch)
+    else:
+        _run_tiles_device(net, Lz, (Ly0, Lx0, nchan), lambda a, b: imgi[a:b], sink, batch_size=batch_size,
+                          tile_overlap=tile_overlap, bsize=bsize, skip_empty_tiles=skip_empty_tiles,
+                          fixed_batch=fixed_batch)
+    return out
+
+
+def run_3D_device(net, imgs, batch_size=8, tile_overlap=0.1, bsize=224, pack_thin=False,
+                  pack_gap_min=24, skip_empty_tiles=None, fixed_batch=False):
+    """run_3D (augment=False) with the stack, the tiles and the flows on the network's device.
+
+    The three orientations are added into the flows as run_3D does (YX, then ZY, then
+    ZX, float32), plane batch by plane batch, so no orientation's full output is held.
+
+    Args:
+        imgs (torch.Tensor): Stack [Lz x Ly x Lx x nchan] (float32) on the device.
+
+    Returns:
+        torch.Tensor: [4 x Lz x Ly x Lx] (float32) on the device: Z, Y, X flow and cell
+            probability (run_3D's yf with the channel axis first).
+    """
+    sstr = ["YX", "ZY", "ZX"]
+    pm = [(0, 1, 2, 3), (1, 0, 2, 3), (2, 0, 1, 3)]
+    cp = [(1, 2), (0, 2), (0, 1)]
+    cpy = [(0, 1), (0, 1), (0, 1)]
+    shape = tuple(imgs.shape[:-1])
+    yf = torch.zeros((4, *shape), dtype=torch.float32, device=imgs.device)
+    for p in range(3):
+        xsl = imgs.permute(pm[p])
+        core_logger.info("running %s: %d planes of size (%d, %d)" %
+                         (sstr[p], shape[pm[p][0]], shape[pm[p][1]], shape[pm[p][2]]))
+
+        def sink(a, y, p=p):
+            b = a + y.shape[0]
+            if p == 0:
+                tgt = lambda c: yf[c, a:b]
+                src = lambda c: y[..., c]
+            elif p == 1:
+                tgt = lambda c: yf[c, :, a:b]
+                src = lambda c: y[..., c].permute(1, 0, 2)
+            else:
+                tgt = lambda c: yf[c, :, :, a:b]
+                src = lambda c: y[..., c].permute(1, 2, 0)
+            tgt(3).add_(src(2))
+            for j in range(2):
+                tgt(cp[p][j]).add_(src(cpy[p][j]))
+
+        run_net_device(net, xsl, batch_size=batch_size, tile_overlap=tile_overlap, bsize=bsize,
+                       pack_thin=pack_thin, pack_gap_min=pack_gap_min,
+                       skip_empty_tiles=skip_empty_tiles, fixed_batch=fixed_batch, sink=sink)
+    return yf
