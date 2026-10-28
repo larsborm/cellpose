@@ -198,7 +198,8 @@ def _evaluate_cellposemodel_cli(args, logger, imf, device, pretrained_model, nor
             ">>>> running cellpose on %d images using all channels" % nimg)
 
     # handle built-in model exceptions
-    model = models.CellposeModel(device=device, pretrained_model=pretrained_model,)
+    model = models.CellposeModel(device=device, pretrained_model=pretrained_model,
+                                 compile=args.compile)
 
     tqdm_out = utils.TqdmToLogger(logger, level=logging.INFO)
 
@@ -238,7 +239,10 @@ def _evaluate_cellposemodel_cli(args, logger, imf, device, pretrained_model, nor
                 z_axis=z_axis,
                 anisotropy=args.anisotropy, 
                 niter=args.niter,
-                flow3D_smooth=args.flow3D_smooth)
+                flow3D_smooth=args.flow3D_smooth,
+                pack_thin=args.pack_thin,
+                pack_gap_min=args.pack_gap_min,
+                skip_empty_tiles=args.skip_empty_tiles)
         masks, flows = out[:2]
 
         if args.exclude_on_edges:

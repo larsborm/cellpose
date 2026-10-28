@@ -83,6 +83,41 @@ slices if the IoU between the mask on the current slice and the next slice is
 greater than or equal to the ``stitch_threshold``.
 
 
+Faster 3D on thin stacks: packing orthogonal slices
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+After the anisotropy resampling, a 3D stack of ``Lz`` planes is run through the
+2D network three times: all xy planes, all zx slices and all zy slices. The two
+orthogonal passes dominate the cost because each slice is only ``Lz`` rows deep
+(e.g. 54 rows for a 29-plane stack at anisotropy 1.87) while the SAM backbone
+takes 256 x 256 tiles: every slice is centred in a 256-row tile with zeros, so
+about 80 % of the orthogonal tiles is padding and the orthogonal passes are
+~90 % of the network work.
+
+``pack_thin=True`` (``--pack_thin`` on the command line) stacks several
+consecutive slices into one tile, separated by zero rows, and cuts the outputs
+apart again. The number of slices per tile is the largest ``k`` such that
+``k * Lz + (k - 1) * pack_gap_min`` fits in the tile after the usual 8-pixel
+border, and the gaps are widened to fill the tile
+(``transforms.pack_layout``); a slice that does not fit twice is processed as
+before. The xy pass is never packed on real images (its planes are larger
+than a tile). The option is ignored with ``augment=True``.
+
+Measured on an H100 with a 29 x 1600 x 1600 stack at anisotropy 1.87
+(``pack_gap_min=24`` gives 3 slices per tile with 39-row gaps): orthogonal
+tiles 25,600 -> 8,600, the whole network stage 3-4x faster. Compared with the
+unpacked result the nuclei centroids match with F1 0.97 on dense tissue and
+0.93 on sparse tissue; gaps narrower than ~24 rows let neighbouring slices
+influence each other and lower the agreement (gap 8: F1 0.96 / 0.90).
+
+Two more options help on large volumes. ``skip_empty_tiles=<threshold>`` skips
+tiles whose maximum normalized value is below the threshold (no cells there;
+they get zero flows and a cell probability of -10). ``CellposeModel(...,
+compile=True)`` compiles the network with ``torch.compile`` (CUDA only, about
+2x faster per tile; the first forward pass takes tens of seconds and partial
+batches are padded to ``batch_size``). Larger ``batch_size`` values (64 on a
+large GPU) are also faster than the default 8.
+
 Training for 3D segmentation
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

@@ -102,7 +102,8 @@ class CellposeModel():
     """
 
     def __init__(self, gpu=False, pretrained_model="cpsam_v2", model_type=None,
-                 diam_mean=None, device=None, nchan=None, use_bfloat16=True):
+                 diam_mean=None, device=None, nchan=None, use_bfloat16=True,
+                 compile=False):
         """
         Initialize the CellposeModel.
 
@@ -113,6 +114,14 @@ class CellposeModel():
             diam_mean (float, optional): Deprecated in v4.0.1+, not used.
             device (torch device, optional): Device used for model running / training (torch.device("cuda") or torch.device("cpu")), overrides gpu input, recommended if you want to use a specific GPU (e.g. torch.device("cuda:1")).
             use_bfloat16 (bool, optional): Use 16bit float precision instead of 32bit for model weights. Default to 16bit (True).
+            compile (bool or str, optional): Compile the network with torch.compile for inference (CUDA only;
+                about 2x faster per tile). True uses torch.compile's default mode: kernels are chosen by
+                heuristics, so every process gets the same kernels and the same outputs. A string is passed as
+                the torch.compile mode (e.g. "max-autotune-no-cudagraphs": ~8 % faster network, kernels
+                chosen by benchmarking in each process, outputs not reproducible between processes). The first
+                forward pass compiles (~30 s in the default mode, minutes with max-autotune); the input shape
+                is fixed, so partial batches are zero-padded to batch_size, and a different batch_size in a
+                later eval call recompiles. Not for training. Default False.
         """
         if diam_mean is not None:
             models_logger.warning(
@@ -162,6 +171,15 @@ class CellposeModel():
 
         models_logger.info(f">>>> loading model {self.pretrained_model}")
         self.net.load_model(self.pretrained_model, device=self.device)
+        self.net_compiled = False
+        if compile:
+            if self.device.type != "cuda":
+                models_logger.warning("compile=True needs a CUDA device, running the network uncompiled")
+            else:
+                mode = compile if isinstance(compile, str) else None
+                self.net = torch.compile(self.net, mode=mode, dynamic=False)
+                self.net_compiled = True
+                models_logger.info(f">>>> network compiled (mode {mode or 'default'}; first forward pass will be slow)")
         
         
     def eval(self, x, batch_size=8, resample=True, channels=None, channel_axis=None,
@@ -169,7 +187,8 @@ class CellposeModel():
              flow_threshold=0.4, cellprob_threshold=0.0, do_3D=False, anisotropy=None,
              flow3D_smooth=0, stitch_threshold=0.0, min_size=15, max_size_fraction=0.4, 
              niter=None, augment=False, tile_overlap=0.1, bsize=None, 
-             compute_masks=True, progress=None):
+             compute_masks=True, progress=None, pack_thin=False, pack_gap_min=24,
+             skip_empty_tiles=None):
         """ segment list of images x, or 4D array - Z x 3 x Y x X
 
         Args:
@@ -209,6 +228,14 @@ class CellposeModel():
             interp (bool, optional): interpolate during 2D dynamics (not available in 3D) . Defaults to True.
             compute_masks (bool, optional): Whether or not to compute dynamics and return masks. Returns empty array if False. Defaults to True.
             progress (QProgressBar, optional): pyqt progress bar. Defaults to None.
+            pack_thin (bool, optional): for do_3D, pack several thin ZY/ZX slices (after the anisotropy
+                resampling) into one tile separated by zero rows instead of padding each slice to the tile
+                size: 3-4x fewer orthogonal tiles with a small, measured cost in accuracy (see the 3D docs).
+                Ignored with augment=True. Defaults to False (output unchanged).
+            pack_gap_min (int, optional): minimum zero rows between packed slices (widened to fill the
+                tile). Defaults to 24.
+            skip_empty_tiles (float, optional): tiles whose maximum normalized value is below this are not
+                run through the network (no cells there). Defaults to None.
 
         Returns:
             A tuple containing (masks, flows, styles): 
@@ -247,7 +274,9 @@ class CellposeModel():
                                 stitch_threshold=stitch_threshold, min_size=min_size, 
                                 max_size_fraction=max_size_fraction, niter=niter, 
                                 augment=augment, tile_overlap=tile_overlap, bsize=bsize, 
-                                compute_masks=compute_masks, progress=progress)
+                                compute_masks=compute_masks, progress=progress,
+                                pack_thin=pack_thin, pack_gap_min=pack_gap_min,
+                                skip_empty_tiles=skip_empty_tiles)
                 self.timing.append(time.time() - tic)
                 masks.append(out[0])
                 flows.append(out[1])
@@ -295,7 +324,9 @@ class CellposeModel():
         dP, cellprob, styles = self._run_net(x, resample=resample, rescale=rescale,
                                              augment=augment, batch_size=batch_size, 
                                              tile_overlap=tile_overlap, bsize=bsize,
-                                             do_3D=do_3D, anisotropy=anisotropy)
+                                             do_3D=do_3D, anisotropy=anisotropy,
+                                             pack_thin=pack_thin, pack_gap_min=pack_gap_min,
+                                             skip_empty_tiles=skip_empty_tiles)
 
         if do_3D and flow3D_smooth:
             if isinstance(flow3D_smooth, (int, float)):
@@ -330,7 +361,8 @@ class CellposeModel():
     
 
     def _run_net(self, x, rescale=1.0, resample=True, augment=False, batch_size=8,
-                 tile_overlap=0.1, bsize=None, anisotropy=1.0, do_3D=False):
+                 tile_overlap=0.1, bsize=None, anisotropy=1.0, do_3D=False,
+                 pack_thin=False, pack_gap_min=24, skip_empty_tiles=None):
         """ run network on image x """
         tic = time.time()
         shape = x.shape
@@ -348,7 +380,10 @@ class CellposeModel():
                 x = transforms.resize_image_3d(x, new_shape, no_channels=False)
                 
             yf, styles = run_3D(self.net, x, batch_size=batch_size, augment=augment,  
-                                tile_overlap=tile_overlap, bsize=bsize)
+                                tile_overlap=tile_overlap, bsize=bsize,
+                                pack_thin=pack_thin, pack_gap_min=pack_gap_min,
+                                skip_empty_tiles=skip_empty_tiles,
+                                fixed_batch=self.net_compiled)
             
             if resample:
                 if rescale != 1.0 or Lz != yf.shape[0]:
@@ -360,7 +395,9 @@ class CellposeModel():
         else:
             yf, styles = run_net(self.net, x, bsize=bsize, augment=augment,
                                  batch_size=batch_size, tile_overlap=tile_overlap, 
-                                 rsz=rescale if rescale !=1.0 else None)
+                                 rsz=rescale if rescale !=1.0 else None,
+                                 skip_empty_tiles=skip_empty_tiles,
+                                 fixed_batch=self.net_compiled)
             if resample:
                 if rescale != 1.0:
                     yf = transforms.resize_image(yf, shape[1], shape[2])

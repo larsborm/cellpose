@@ -781,6 +781,30 @@ def resize_image_3d(img, shape, interpolation=cv2.INTER_LINEAR, no_channels=Fals
                                no_channels=no_channels).astype(img.dtype).transpose(tt)
     return img_rsz
 
+def pack_layout(Ly, bsize=256, gap_min=24, border=8):
+    """Layout for packing thin planes into one tile (see core.run_net pack_thin).
+
+    Planes of Ly rows are stacked k at a time into one tile of bsize rows with
+    zero rows between them: the largest k such that k * Ly + (k - 1) * gap_min
+    fits inside the tile after get_pad_yx's border (extra * div // 2 = 8 rows on
+    each side), and the gap widened so the group fills the usable rows.
+
+    Args:
+        Ly (int): Rows of one plane.
+        bsize (int): Tile size.
+        gap_min (int): Minimum zero rows between packed planes (3 tokens of 8 px).
+        border (int): Rows reserved on each side by get_pad_yx.
+
+    Returns:
+        tuple[int, int]: (k, gap); (1, 0) when a plane does not fit twice.
+    """
+    avail = int(bsize) - 2 * int(border)
+    k = max(1, (avail + gap_min) // (int(Ly) + gap_min))
+    if k == 1:
+        return 1, 0
+    return int(k), int((avail - k * Ly) // (k - 1))
+
+
 def get_pad_yx(Ly, Lx, div=16, extra=1, min_size=None):
     if min_size is None or Ly >= min_size[-2]:
         Lpad = int(div * np.ceil(Ly / div) - Ly)

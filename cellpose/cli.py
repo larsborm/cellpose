@@ -25,6 +25,8 @@ def get_arg_parser():
 
     # settings for CPU vs GPU
     hardware_args = parser.add_argument_group("Hardware Arguments")
+    hardware_args.add_argument("--compile", action="store_true",
+                               help="compile the network with torch.compile (CUDA only, inference)")
     hardware_args.add_argument("--use_gpu", action="store_true",
                                help="use gpu or mps if torch with cuda installed")
     hardware_args.add_argument(
@@ -97,6 +99,15 @@ def get_arg_parser():
     algorithm_args.add_argument(
         "--do_3D", action="store_true",
         help="process images as 3D stacks of images (nplanes x nchan x Ly x Lx")
+    algorithm_args.add_argument(
+        "--pack_thin", action="store_true",
+        help="3D: pack several thin ZY/ZX slices per tile instead of padding each to the tile size (faster)")
+    algorithm_args.add_argument(
+        "--pack_gap_min", required=False, default=24, type=int,
+        help="3D with --pack_thin: minimum zero rows between packed slices")
+    algorithm_args.add_argument(
+        "--skip_empty_tiles", required=False, default=None, type=float,
+        help="skip tiles whose maximum normalized value is below this threshold")
     algorithm_args.add_argument(
         "--diameter", required=False, default=None, type=float, help=
         "use to resize cells to the training diameter (30 pixels)"
