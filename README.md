@@ -1,3 +1,14 @@
+> **pysmFISH fork of Cellpose.** This branch is Cellpose v4.2.1.1 with opt-in
+> options for faster 3D segmentation of large stacks: packing thin slices,
+> skipping empty tiles, a compiled network, 3D evaluation on the GPU, and masks
+> without flows or hole filling. With the defaults it behaves as Cellpose
+> v4.2.1.1. What changed, and what each change is useful for:
+> [PYSMFISH_CHANGES.md](PYSMFISH_CHANGES.md). Install:
+> `pip install "cellpose @ git+https://github.com/larsborm/cellpose.git@v4.2.1.1+pysmfish.1"`.
+> This is not an official Cellpose release; for Cellpose itself see
+> [MouseLand/cellpose](https://github.com/MouseLand/cellpose). The changes were
+> developed with the help of an AI coding assistant (Claude).
+
 # <p>  <b>Cellpose </b> </p>
 <img src="http://www.cellpose.org/static/images/logo.png?raw=True" width="250" title="cellpose" alt="cellpose" align="right" vspace = "50">
 
